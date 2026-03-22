@@ -48,6 +48,7 @@ public class DibujoConGestos extends JFrame {
         private boolean dibujando = false;
         private Color colorActual = Color.RED;
         private int grosor = 8;
+        private int num = 0;
 
         public DrawingPanel() {
             setBackground(Color.WHITE);
@@ -59,6 +60,7 @@ public class DibujoConGestos extends JFrame {
             if (partes.length == 0) return;
 
             String tipo = partes[0];
+          
 
             if ("DIBUJAR".equals(tipo) && partes.length == 3) {
                 try {
@@ -96,9 +98,21 @@ public class DibujoConGestos extends JFrame {
                 dibujando = false;
             }
             else if ("CAMBIAR_COLOR".equals(tipo)) {
-                // Ejemplo: ciclo de colores
-                Color[] colores = {Color.RED, Color.BLUE, Color.GREEN, Color.ORANGE, Color.MAGENTA};
-                colorActual = colores[(colores.length + 1) % colores.length];
+
+                                    
+            Timer timer = new Timer(3000, e -> {
+                        System.out.println("Acción repetida cada 1 segundos");
+                      
+                    });
+                    timer.start();
+                           Color[] colores = {Color.RED, Color.BLUE, Color.GREEN, Color.ORANGE, Color.MAGENTA};
+                colorActual = colores[num  % colores.length];
+                 num += 1;
+
+          
+                
+
+               
             }
         }
 
