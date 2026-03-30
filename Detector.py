@@ -8,7 +8,6 @@ mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-# Configuración del socket (se conecta a Java)
 HOST = "127.0.0.1"
 PORT = 65432
 
@@ -24,49 +23,41 @@ while not connected:
         time.sleep(1)
 
 
-def dedo_levantado(landmark_tip, landmark_mcp, landmark_pip=None):
-    """True si el dedo está levantado (arriba)"""
-    if landmark_pip is None:
-        return landmark_tip.y < landmark_mcp.y
-    return landmark_tip.y < landmark_pip.y and landmark_pip.y < landmark_mcp.y
+def dedo_levantado(landmark_tip, landmark_mcp):
+    return landmark_tip.y < landmark_mcp.y
 
 
 def distancia_3d(a, b):
-    """Distancia euclidiana entre dos landmarks (coordenadas normalizadas 0-1)"""
     return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
 
 
-# ── Configuración del gesto ZOOM ────────────────────────────────────────────
-#
-#   Gesto: índice (8) + medio (12) + pulgar (4) levantados,
-#          anular y meñique doblados.
-#
-#   La "distancia de pinza" se mide como el promedio de:
-#     · pulgar ↔ índice
-#     · pulgar ↔ medio
-#
-#   Umbral CERCA  → ZOOM +  (dedos juntos  = acercar)
-#   Umbral LEJOS  → ZOOM -  (dedos abiertos = alejar)
-#
-#   Los umbrales están en coordenadas normalizadas (0-1).
-#   Ajusta ZOOM_CERCA / ZOOM_LEJOS si tu cámara captura diferente.
-#
-ZOOM_CERCA  = 0.08   # distancia media < esto → acercar
-ZOOM_LEJOS  = 0.18   # distancia media > esto → alejar
-# Entre ZOOM_CERCA y ZOOM_LEJOS → zona neutra (no envía zoom)
+def centro_mano(lm):
+    puntos = [lm[0], lm[5], lm[9], lm[13], lm[17]]
+    cx = sum(p.x for p in puntos) / len(puntos)
+    cy = sum(p.y for p in puntos) / len(puntos)
+    cz = sum(p.z for p in puntos) / len(puntos)
+    return cx, cy, cz
 
-# Para no saturar Java con miles de comandos ZOOM por segundo,
-# limitamos la frecuencia mínima entre envíos de zoom.
-ZOOM_COOLDOWN = 0.08   # segundos mínimos entre dos comandos ZOOM
-ultimo_zoom   = 0.0    # timestamp del último ZOOM enviado
 
+class Punto:
+    def __init__(self, x, y, z):
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+# ── Constantes ZOOM ──────────────────────────────────────────
+ZOOM_JUNTO    = 0.28
+ZOOM_LEJOS    = 0.30
+ZOOM_COOLDOWN = 0.05
+ultimo_zoom   = 0.0
 
 cap = cv2.VideoCapture(0)
 
 with mp_hands.Hands(
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7,
-    max_num_hands=1
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+    max_num_hands=2
 ) as hands:
 
     while cap.isOpened():
@@ -81,7 +72,7 @@ with mp_hands.Hands(
         comando = "NONE"
         x_norm  = None
         y_norm  = None
-        zoom_dir = None   # "+" | "-" | None
+        manos   = []
 
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
@@ -95,84 +86,94 @@ with mp_hands.Hands(
 
                 lm = hand_landmarks.landmark
 
-                # ── Estado de cada dedo ──────────────────────────────────
                 indice_arriba  = dedo_levantado(lm[8],  lm[5])
                 medio_arriba   = dedo_levantado(lm[12], lm[9])
                 anular_arriba  = dedo_levantado(lm[16], lm[13])
                 menique_arriba = dedo_levantado(lm[20], lm[17])
-                pulgar_arriba  = lm[4].x < lm[3].x   # aproximado para mano derecha
+                pulgar_arriba  = lm[4].x < lm[3].x - 0.02
 
-                # ── Gesto ZOOM: pulgar + índice + medio levantados ───────
-                #    anular y meñique doblados
-                es_gesto_zoom = (
-                    indice_arriba and
-                    medio_arriba  and
-                    pulgar_arriba and
-                    not anular_arriba and
-                    not menique_arriba
+                cinco_dedos = (
+                    indice_arriba and medio_arriba and
+                    anular_arriba and menique_arriba and pulgar_arriba
                 )
 
-                if es_gesto_zoom:
-                    # Distancia media de la "pinza"
-                    d_pulgar_indice = distancia_3d(lm[4], lm[8])
-                    d_pulgar_medio  = distancia_3d(lm[4], lm[12])
-                    distancia_media = (d_pulgar_indice + d_pulgar_medio) / 2.0
+                cx, cy, cz = centro_mano(lm)
 
-                    ahora = time.time()
+                manos.append({
+                    "lm":             lm,
+                    "indice_arriba":  indice_arriba,
+                    "medio_arriba":   medio_arriba,
+                    "anular_arriba":  anular_arriba,
+                    "menique_arriba": menique_arriba,
+                    "pulgar_arriba":  pulgar_arriba,
+                    "cinco_dedos":    cinco_dedos,
+                    "cx": cx, "cy": cy, "cz": cz,
+                })
 
-                    if distancia_media < ZOOM_CERCA:
-                        zoom_dir = "+"
-                    elif distancia_media > ZOOM_LEJOS:
-                        zoom_dir = "-"
-                    # zona neutra → zoom_dir queda None, no enviamos nada
+        # ── Lógica principal ─────────────────────────────────
+        if len(manos) == 2:
+            # ── ZOOM: distancia entre las 2 manos ────────────
+            m0, m1 = manos[0], manos[1]
+            p0 = Punto(m0["cx"], m0["cy"], m0["cz"])
+            p1 = Punto(m1["cx"], m1["cy"], m1["cz"])
+            dist_actual = distancia_3d(p0, p1)
 
-                    # Dibujamos la distancia en pantalla para ayudar a calibrar
-                    texto_zoom = f"ZOOM {'IN' if zoom_dir=='+' else 'OUT' if zoom_dir=='-' else 'NEUTRO'}  d={distancia_media:.3f}"
-                    cv2.putText(frame, texto_zoom, (10, 80),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                (0, 255, 255) if zoom_dir else (180, 180, 180), 2)
+            ahora    = time.time()
+            zoom_dir = None
 
-                    if zoom_dir and (ahora - ultimo_zoom) >= ZOOM_COOLDOWN:
-                        comando    = f"ZOOM {zoom_dir}"
-                        ultimo_zoom = ahora
-                        # salimos del loop de manos (solo necesitamos una)
-                        break
+            if dist_actual < ZOOM_JUNTO:
+                zoom_dir = "+++"   # manos juntas  → acercar
+            elif dist_actual > ZOOM_LEJOS:
+                zoom_dir = "---"   # manos alejadas → alejar
 
-                # ── Gesto DIBUJAR: índice + medio levantados, anular abajo ─
-                elif indice_arriba and medio_arriba and not anular_arriba:
-                    comando = "DIBUJAR"
-                    idx    = lm[8]
-                    x_norm = idx.x
-                    y_norm = 1.0 - idx.y
+            # Línea visual entre centros de manos
+            h, w = frame.shape[:2]
+            px0 = (int(m0["cx"] * w), int(m0["cy"] * h))
+            px1 = (int(m1["cx"] * w), int(m1["cy"] * h))
+            color_linea = (0, 255, 0) if zoom_dir == "+++" else (0, 0, 255) if zoom_dir == "---" else (180, 180, 180)
+            cv2.line(frame, px0, px1, color_linea, 2)
+            cv2.putText(frame,
+                        f"dist: {dist_actual:.3f}  {'JUNTO' if zoom_dir=='+++' else 'LEJOS' if zoom_dir=='---' else 'NEUTRO'}",
+                        (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_linea, 2)
 
-                # ── Gesto BORRAR TODO: medio + anular levantados, índice abajo
-                elif not indice_arriba and medio_arriba and anular_arriba:
-                    comando = "BORRAR_TODO"
+            if zoom_dir and (ahora - ultimo_zoom) >= ZOOM_COOLDOWN:
+                comando     = f"ZOOM {zoom_dir}"
+                ultimo_zoom = ahora
 
-                # ── Gesto BORRADOR: índice + anular, medio abajo ─────────
-                elif indice_arriba and not medio_arriba and anular_arriba:
-                    comando = "BORRADOR"
+        elif len(manos) == 1:
+            # ── Gestos de 1 mano ─────────────────────────────
+            m  = manos[0]
 
-                # ── Gesto CAMBIAR COLOR: pulgar + índice ─────────────────
-                elif pulgar_arriba and indice_arriba:
-                    comando = "CAMBIAR_COLOR"
+            if m["cinco_dedos"]:
+                comando = "MOVER"
+                x_norm  = m["cx"]
+                y_norm  = 1.0 - m["cy"]
 
-        # ── Preparar y enviar mensaje ────────────────────────────────────
+            elif not m["indice_arriba"] and m["medio_arriba"] and m["anular_arriba"]:
+                comando = "BORRAR_TODO"
+
+            elif m["indice_arriba"] and not m["medio_arriba"] and m["anular_arriba"]:
+                comando = "BORRADOR"
+
+            elif m["pulgar_arriba"] and m["indice_arriba"]:
+                comando = "CAMBIAR_COLOR"
+
+        # ── Preparar y enviar mensaje ─────────────────────────
         if comando.startswith("ZOOM"):
-            mensaje = f"{comando}\n"                               # "ZOOM +\n" o "ZOOM -\n"
-        elif comando == "DIBUJAR" and x_norm is not None:
-            mensaje = f"DIBUJAR {x_norm:.4f} {y_norm:.4f}\n"
+            mensaje = f"{comando}\n"
+        elif comando == "MOVER" and x_norm is not None:
+            mensaje = f"MOVER {x_norm:.4f} {y_norm:.4f}\n"
         else:
             mensaje = f"{comando}\n"
 
         # Mostrar comando activo en pantalla
         color_texto = {
-            "DIBUJAR":      (0, 255, 0),
+            "MOVER":        (0, 255, 0),
             "BORRAR_TODO":  (0, 0, 255),
             "BORRADOR":     (255, 100, 0),
             "CAMBIAR_COLOR":(255, 0, 255),
             "NONE":         (150, 150, 150),
-        }.get(comando.split()[0], (0, 220, 220))   # ZOOM → cyan
+        }.get(comando.split()[0], (0, 220, 220))
 
         cv2.putText(frame, f"CMD: {comando.strip()}", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color_texto, 2)
